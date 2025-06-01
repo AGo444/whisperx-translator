@@ -1,0 +1,6 @@
+transformers
+torch
+torchaudio
+whisperx
+pysrt
+pyannote.audio

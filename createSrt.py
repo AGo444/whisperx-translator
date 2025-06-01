@@ -1,241 +1,178 @@
-#!/usr/bin/env python3
-
 import os
-import glob
 import subprocess
 import pysrt
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import sys
+import argparse
+import re
 
-# --- Configuratie ---
-WHISPER_MODEL = "large-v3" # Het grote Whisper model
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Hugging Face Model voor Engels naar Nederlands vertaling
+# --- Configuration ---
+DEFAULT_TARGET_LANGUAGE = "nl"
+WHISPERX_MODEL = "large-v3"
 HF_TRANSLATE_MODEL = "Helsinki-NLP/opus-mt-en-nl"
+INPUT_DIR = "/data"
 
-# Lees de doeltaal uit een omgevingsvariabele, standaard naar 'nl'
-TARGET_LANGUAGE = os.environ.get("TARGET_LANGUAGE", "nl")
-print(f"⚙️ Doeltaal ingesteld op: {TARGET_LANGUAGE.upper()}")
-
-# --- Initialiseer Hugging Face Model (wordt aangeroepen in main) ---
-hf_tokenizer = None
-hf_model = None
-
-def load_hf_translate_model():
-    """Laadt het Hugging Face vertaalmodel en tokenizer."""
-    global hf_tokenizer, hf_model
-    try:
-        print(f"🌐 Laden van Hugging Face vertaalmodel: {HF_TRANSLATE_MODEL} op apparaat: {DEVICE}...")
-        hf_tokenizer = AutoTokenizer.from_pretrained(HF_TRANSLATE_MODEL)
-        hf_model = AutoModelForSeq2SeqLM.from_pretrained(HF_TRANSLATE_MODEL).to(DEVICE)
-        print("✅ Hugging Face vertaalmodel succesvol geladen.")
-    except Exception as e:
-        print(f"❌ Fout bij het laden van Hugging Face vertaalmodel: {e}")
-        hf_tokenizer = None
-        hf_model = None
-
-# --- Functies ---
-
-def run_whisperx(audio_path, output_dir, lang_code="en"):
+# --- Helper Functions ---
+def clean_filename(filename):
     """
-    Voert WhisperX uit om ondertitels te genereren.
-    Zorgt ervoor dat de output bestandsnaam .lang_code.srt is.
+    Removes potentially problematic characters from a filename,
+    especially useful for paths in shell commands.
     """
-    print(f"🎧 Genereren van {lang_code.upper()} ondertitels voor: {os.path.basename(audio_path)}")
+    return re.sub(r'[^\w\s\-\.\_]', '', filename).strip()
+
+def is_video_file(filepath):
+    """Checks if a file is a common video format."""
+    return filepath.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv'))
+
+def get_target_language_prefix(target_language):
+    """Returns the correct prefix for the Hugging Face translation model."""
+    return f">>{target_language}<<"
+
+def generate_subtitles(video_path, output_dir, target_language):
+    """
+    Generates English subtitles using WhisperX and then translates them.
+    Handles existing SRT files to resume processing.
+    """
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_base_path = os.path.join(output_dir, base_name)
+    english_srt_path = f"{output_base_path}.en.srt"
+    target_srt_path = f"{output_base_path}.{target_language}.srt"
+
+    # --- Logging for ALL existing SRT files related to this video ---
+    found_any_srt = False
+    for filename in os.listdir(output_dir):
+        if filename.startswith(base_name) and filename.endswith('.srt'):
+            full_srt_path = os.path.join(output_dir, filename)
+            if os.path.isfile(full_srt_path) and os.path.getsize(full_srt_path) > 0:
+                print(f"Found existing SRT: {filename}")
+                found_any_srt = True
+    if not found_any_srt:
+        print("Found no existing .srt files for this video.")
+    # --- End logging for ALL existing SRT files ---
+
+    # Check if target language SRT already exists and is not empty
+    if os.path.exists(target_srt_path) and os.path.getsize(target_srt_path) > 0:
+        print(f"✅ Skipping '{video_path}': '{target_language}' subtitles already exist and are not empty.")
+        return
+
+    # Check if English SRT exists and is not empty
+    if os.path.exists(english_srt_path) and os.path.getsize(english_srt_path) > 0:
+        print(f"➡️ English subtitles already exist for '{video_path}'. Proceeding to translate.")
+    else:
+        print(f"🎧 Generating EN subtitles for: {video_path}")
+        whisperx_command = [
+            "whisperx",
+            video_path,
+            "--model", WHISPERX_MODEL,
+            "--output_dir", output_dir,
+            "--output_format", "srt",
+            "--language", "en", # Force English transcription
+            "--batch_size", "8",
+            "--compute_type", "float16",
+            "--align_model", "WAV2VEC2_ASR_LARGE_LV60K_960H"
+        ]
+        print(f"➡️ Executing WhisperX command: {' '.join(whisperx_command)}")
+        try:
+            process = subprocess.Popen(whisperx_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            for line in iter(process.stdout.readline, ''):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            process.wait()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, " ".join(whisperx_command))
+            print(f"✅ WhisperX successfully executed for {video_path}")
+            # --- Log that English file is created ---
+            print(f"Created {os.path.basename(english_srt_path)}")
+            # --- End log ---
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Error during WhisperX processing for '{video_path}':")
+            print(f"Command: {e.cmd}")
+            print(f"Return Code: {e.returncode}")
+            print(f"Output: {e.output}")
+            return
+        except FileNotFoundError:
+            print(f"❌ Error: 'whisperx' command not found. Is WhisperX installed correctly in the container?")
+            return
+
+    # Translate the English SRT to the target language
+    if os.path.exists(english_srt_path) and os.path.getsize(english_srt_path) > 0:
+        print(f"🌐 Translating '{english_srt_path}' to '{target_language}' with Hugging Face model '{HF_TRANSLATE_MODEL}'...")
+        try:
+            translate_srt(english_srt_path, target_srt_path, target_language)
+            print(f"✅ Translated subtitles saved as: {target_srt_path}")
+        except Exception as e:
+            print(f"❌ Error during translation for '{video_path}': {e}")
+    else:
+        print(f"⚠️ No English SRT found for '{video_path}' after transcription. Skipping translation.")
+
+    print(f"\n--- Summary for {os.path.basename(video_path)} ---")
+    print(f"English SRT: {english_srt_path} {'(Generated)' if os.path.exists(english_srt_path) and os.path.getsize(english_srt_path) > 0 and not os.path.exists(target_srt_path) else '(Exists)' if os.path.exists(english_srt_path) and os.path.getsize(english_srt_path) > 0 else '(Failed/Missing)'}")
+    print(f"Target ({target_language}) SRT: {target_srt_path} {'(Generated)' if os.path.exists(target_srt_path) and os.path.getsize(target_srt_path) > 0 else '(Failed/Missing)'}")
+    print("------------------------------------------\n")
+
+
+def translate_srt(input_srt_path, output_srt_path, target_language):
+    """Translates an SRT file using Hugging Face's Transformers."""
+    from transformers import pipeline
+    print("🌐 Loading Hugging Face translation model...")
+    translator = pipeline("translation", model=HF_TRANSLATE_MODEL, device=0)
+    print("✅ Hugging Face translation model successfully loaded.")
+
+    subs = pysrt.open(input_srt_path, encoding='utf-8')
+    translated_subs = pysrt.SubRipFile()
+
+    lang_prefix = get_target_language_prefix(target_language)
+
+    texts_to_translate = [f"{lang_prefix} {sub.text}" for sub in subs]
     
-    batch_size = 1 # Batch size is 1 voor het large-v3 model
-    compute_type = "float16" # Behoud float16, dit is geheugenvriendelijker
-
-    # WhisperX genereert standaard [basenaam].srt als output_format srt is
-    # We laten het dit eerst doen, en hernoemen het daarna
-    whisperx_raw_output_path = os.path.join(output_dir, os.path.basename(audio_path).replace(".mkv", ".srt").replace(".mp4", ".srt"))
-    
-    # De uiteindelijke gewenste naam (bijv. .en.srt)
-    final_output_srt_path = os.path.join(output_dir, os.path.basename(audio_path).replace(".mkv", f".{lang_code}.srt").replace(".mp4", f".{lang_code}.srt"))
-
-    command = [
-        "whisperx",
-        audio_path,
-        "--model", WHISPER_MODEL, # Gebruikt het large-v3 model
-        "--output_dir", output_dir,
-        "--output_format", "srt",
-        "--task", "transcribe",
-        "--language", lang_code,
-        "--batch_size", str(batch_size),
-        "--compute_type", compute_type,
-        "--device", DEVICE
-    ]
-    
-    print(f"    ➡️ Executing WhisperX command: {' '.join(command)}")
-    print("    Wachten op WhisperX output...")
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        print(f"✅ WhisperX succesvol uitgevoerd voor {os.path.basename(audio_path)}")
-        
-        if result.stdout:
-            print(f"    WhisperX stdout:\n{result.stdout}")
-        if result.stderr:
-            print(f"    WhisperX stderr:\n{result.stderr}")
-
-        if os.path.exists(whisperx_raw_output_path):
-            if whisperx_raw_output_path != final_output_srt_path:
-                os.rename(whisperx_raw_output_path, final_output_srt_path)
-                print(f"✅ Hernoemd van '{os.path.basename(whisperx_raw_output_path)}' naar '{os.path.basename(final_output_srt_path)}'")
-            return final_output_srt_path
-        else:
-            print(f"❌ Fout: Verwachte WhisperX output '{os.path.basename(whisperx_raw_output_path)}' niet gevonden na uitvoering.")
-            return None
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Fout bij WhisperX uitvoering voor {os.path.basename(audio_path)}: {e}")
-        print(f"Stderr: {e.stderr}")
-        return None
-    except Exception as e:
-        print(f"❌ Onverwachte fout bij WhisperX uitvoering voor {os.path.basename(audio_path)}: {e}")
-        return None
-
-def translate_srt(english_srt_path, target_lang): # target_lang komt nu van de env var
-    """Vertaalt een SRT-bestand met het Hugging Face model."""
-    global hf_tokenizer, hf_model
-    
-    if hf_model is None or hf_tokenizer is None:
-        print("❌ Hugging Face vertaalmodel niet geladen, kan niet vertalen.")
-        return None
-
-    print(f"🌐 Vertalen '{os.path.basename(english_srt_path)}' naar {target_lang.upper()} met Hugging Face...")
-    
-    try:
-        subs = pysrt.open(english_srt_path, encoding='utf-8')
-        translated_subs = pysrt.SubRipFile()
-
-        texts_to_translate = [sub.text for sub in subs]
-        translated_texts = []
-
-        batch_size = 32 # Vertaal in batches van 32 zinnen
-        total_batches = (len(texts_to_translate) + batch_size - 1) // batch_size
-        
-        for i in range(0, len(texts_to_translate), batch_size):
-            batch_num = (i // batch_size) + 1
-            print(f"    ➡️ Verwerken van vertaalbatch {batch_num} van {total_batches}...", end='\r')
-            batch = texts_to_translate[i:i+batch_size]
+    batch_size = 16
+    for i in range(0, len(texts_to_translate), batch_size):
+        batch = texts_to_translate[i:i + batch_size]
+        print(f"➡️ Processing translation batch {i//batch_size + 1} of {len(texts_to_translate)//batch_size + 1}...")
+        try:
+            if not batch:
+                continue
             
-            # Belangrijk: De prefix voor het vertaalmodel moet overeenkomen met het model.
-            # Voor 'Helsinki-NLP/opus-mt-en-nl' is '>>nl<<' correct.
-            # Als je naar een andere taal vertaalt, moet dit '>>[taalcode]<<' zijn.
-            # We voegen de prefix toe aan elke tekst in de batch.
-            prefixed_batch = [f">>{target_lang}<< {text}" for text in batch]
-
-            inputs = hf_tokenizer(prefixed_batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(DEVICE)
+            translated_batch = translator(batch)
+            translated_texts = [item['translation_text'] for item in translated_batch]
             
-            with torch.no_grad():
-                translated_ids = hf_model.generate(inputs.input_ids, num_beams=5, early_stopping=True, max_length=hf_tokenizer.model_max_length)
-            
-            translated_batch = hf_tokenizer.batch_decode(translated_ids, skip_special_tokens=True)
-            translated_texts.extend(translated_batch)
-        print() # Nieuwe regel na de voortgang
+            for j, sub_text in enumerate(translated_texts):
+                original_sub = subs[i+j]
+                new_sub = pysrt.SubRipItem(index=original_sub.index, start=original_sub.start, end=original_sub.end, text=sub_text)
+                translated_subs.append(new_sub)
+        except Exception as e:
+            print(f"❌ Error during translation batch processing (batch {i//batch_size + 1}): {e}")
+            raise
 
-        if len(translated_texts) != len(subs):
-            print("WAARSCHUWING: Aantal vertaalde zinnen komt niet overeen met origineel.")
+    translated_subs.save(output_srt_path, encoding='utf-8')
 
-        for i, sub in enumerate(subs):
-            new_sub = pysrt.SubRipItem(index=sub.index, start=sub.start, end=sub.end, text=translated_texts[i])
-            translated_subs.append(new_sub)
-
-        base_name_no_ext = os.path.splitext(english_srt_path)[0]
-        if base_name_no_ext.endswith(".en"):
-            base_name_no_ext = base_name_no_ext[:-3]
-        dutch_srt_path = f"{base_name_no_ext}.{target_lang}.srt" # Gebruik target_lang hier
-        
-        translated_subs.save(dutch_srt_path, encoding='utf-8')
-        print(f"✅ Vertaalde ondertitels opgeslagen als: {dutch_srt_path}")
-        return dutch_srt_path
-
-    except Exception as e:
-        print(f"❌ Fout bij vertalen van ondertitels: {e}")
-        base_name_no_ext = os.path.splitext(english_srt_path)[0]
-        if base_name_no_ext.endswith(".en"):
-            base_name_no_ext = base_name_no_ext[:-3]
-        dutch_srt_path = f"{base_name_no_ext}.{target_lang}.srt" # Gebruik target_lang hier
-        with open(dutch_srt_path, 'w', encoding='utf-8') as f:
-            f.write("")
-        print(f"❌ Vertaalproces mislukt, leeg SRT-bestand gemaakt: {dutch_srt_path}")
-        return None
-
-# --- Hoofdlogica ---
+# --- Main Logic ---
 if __name__ == "__main__":
-    print("📝 Start transcriptie- en vertaalscript...")
+    parser = argparse.ArgumentParser(description="Generate and translate subtitles for video files.")
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=DEFAULT_TARGET_LANGUAGE,
+        help=f"Target language for translation (e.g., 'nl', 'de', 'fr'). Defaults to '{DEFAULT_TARGET_LANGUAGE}'."
+    )
+    args = parser.parse_args()
 
-    load_hf_translate_model()
+    target_language = args.language.lower()
+    print(f"Starting subtitle generation and translation process for target language: {target_language}")
 
-    # Recursief zoeken in /data en subdirectories
-    video_files = []
-    video_files.extend(glob.glob("/data/**/*.mkv", recursive=True))
-    video_files.extend(glob.glob("/data/**/*.mp4", recursive=True))
-    
-    video_files.sort()
+    if not os.path.exists(INPUT_DIR):
+        print(f"❌ Error: Input directory '{INPUT_DIR}' does not exist. Please ensure your volume is mounted correctly.")
+        sys.exit(1)
 
-    if not video_files:
-        print("Geen MKV- of MP4-bestanden gevonden in de /data map of subdirectories.")
-        print("---------------------------------------")
-        print("Geen bestanden meer om te verwerken. Container stopt.")
-        exit(0) # Container stopt hier als er niets te doen is
+    found_videos = False
+    for root, _, files in os.walk(INPUT_DIR):
+        for file in files:
+            if is_video_file(file):
+                found_videos = True
+                video_full_path = os.path.join(root, file)
+                print(f"\n--- Processing video: {video_full_path} ---")
+                generate_subtitles(video_full_path, root, target_language)
 
-    for video_file in video_files:
-        print(f"\n🎧 Verwerken van: {os.path.basename(video_file)}")
-
-        base_name = os.path.splitext(video_file)[0]
-        english_srt_path_expected = f"{base_name}.en.srt" 
-        destination_srt_path_expected = f"{base_name}.{TARGET_LANGUAGE}.srt" # Dit is de doeltaal SRT
-
-        # --- NIEUWE LOGICA: Controleer EERST op de aanwezigheid van de doeltaal SRT ---
-        if os.path.exists(destination_srt_path_expected) and os.path.getsize(destination_srt_path_expected) > 0:
-            print(f"✅ {TARGET_LANGUAGE.upper()} ondertitels al aanwezig: {destination_srt_path_expected}. Overslaan.")
-            continue # Sla dit bestand volledig over en ga naar het volgende video bestand.
-
-        # Als de doeltaal SRT niet bestaat of leeg is, gaan we verder met transcriberen/vertalen
-        en_status = "Niet gegenereerd"
-        nl_status = "Niet gegenereerd"
-        english_srt_for_translation = None # Initialiseer dit als None
-
-        # Controleer vervolgens op de Engelse (bron) SRT
-        if not os.path.exists(english_srt_path_expected) or os.path.getsize(english_srt_path_expected) == 0:
-            print(f"🔄 Genereert Engelse ondertitels voor: {os.path.basename(video_file)}")
-            generated_srt = run_whisperx(video_file, os.path.dirname(video_file), lang_code="en") # Output in dezelfde map als video
-            if not generated_srt:
-                print(f"❌ Kon geen Engelse ondertitels genereren voor {os.path.basename(video_file)}. Overslaan vertaling.")
-                en_status = "Transcriptiefout"
-                # Als de transcriptie mislukt, blijft english_srt_for_translation None, en wordt de vertaling overgeslagen.
-            else:
-                english_srt_for_translation = generated_srt
-                en_status = "Gegenereerd"
-        else:
-            print(f"✅ Engelse ondertitels al aanwezig: {english_srt_path_expected}. Direct vertalen.")
-            english_srt_for_translation = english_srt_path_expected
-            en_status = "Al aanwezig"
-
-        # Ga verder met vertalen als er een Engelse SRT beschikbaar is (bestaand of zojuist gegenereerd)
-        if english_srt_for_translation: # Alleen proberen te vertalen als we een Engelse SRT hebben
-            if hf_model is not None and hf_tokenizer is not None:
-                # De controle op de aanwezigheid van destination_srt_path_expected is al aan het begin van de loop gedaan.
-                # Dus hier proberen we altijd te vertalen als english_srt_for_translation beschikbaar is.
-                translated_srt = translate_srt(english_srt_for_translation, TARGET_LANGUAGE)
-                if not translated_srt:
-                    print(f"❌ Kon geen {TARGET_LANGUAGE.upper()} ondertitels vertalen voor {os.path.basename(video_file)}.")
-                    nl_status = "Vertaalfout"
-                else:
-                    nl_status = "Vertaald"
-            else:
-                print("Skippen van vertaling omdat het Hugging Face vertaalmodel niet geladen kon worden.")
-                nl_status = "Vertaalmodel ontbreekt"
-        else:
-            print(f"⚠️ Geen Engelse ondertitels beschikbaar voor vertaling voor {os.path.basename(video_file)}.")
-            nl_status = "Geen EN SRT om te vertalen"
-
-        print(f"\n--- Samenvatting voor {os.path.basename(video_file)} ---")
-        print(f"  Engelse SRT status: {en_status}")
-        print(f"  {TARGET_LANGUAGE.upper()} SRT status: {nl_status}")
-        print("-----------------------------------\n")
-
-    print("\n---------------------------------------")
-    print("Alle bestanden verwerkt. Container stopt.")
-    exit(0) # Container stopt na verwerking van alle bestanden
+    if not found_videos:
+        print(f"No supported video files (.mp4, .mkv, etc.) found in '{INPUT_DIR}' or its subdirectories.")
+        print("Please ensure your video files are in the mounted /data directory.")

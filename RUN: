@@ -1,0 +1,19 @@
+RUN:
+
+argostranslate translate "hello world" --from-lang en --to-lang nl
+
+
+docker run --rm --gpus all \
+  -v "/mnt/user/TV-Series/The Big Bang Theory (2007)/Season 4":/data \
+  whisperx-nl
+
+shell
+
+docker run -it --rm \
+  --gpus all \
+  -v /mnt/user/appdata/whisper-nl:/data \
+  --entrypoint /bin/bash \
+  whisperx-translator-gpu
+
+  BBuild:
+  docker build -t whisperx-translator .
