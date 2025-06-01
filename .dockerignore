@@ -1,0 +1,7 @@
+# Bestanden en mappen die genegeerd moeten worden door Docker
+.git/
+.gitignore
+__pycache__/
+*.zip
+*.log
+# Voeg hier eventuele grote databestanden toe die niet in de image hoeven

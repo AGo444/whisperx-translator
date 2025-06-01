@@ -1,0 +1,8 @@
+# Bestanden en mappen die genegeerd moeten worden door Git
+.DS_Store
+Archief.zip
+docker_build_log.txt
+__pycache__/
+*.log
+models/ # Als je models lokaal download buiten de Docker context
+# Voeg hier meer tijdelijke of gegenereerde bestanden toe die je niet wilt versionere
